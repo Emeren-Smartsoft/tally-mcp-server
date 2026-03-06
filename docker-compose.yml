@@ -1,0 +1,53 @@
+version: '3.8'
+
+services:
+  tally-mcp-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: tally-mcp-server
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=production
+      - TALLY_HOST=${TALLY_HOST:-localhost}
+      - TALLY_PORT=${TALLY_PORT:-9000}
+      - TALLY_ODBC_DSN=${TALLY_ODBC_DSN:-TallyODBC}
+    volumes:
+      - ./tally-config.yml:/app/tally-config.yml:ro
+      - ./logs:/app/logs
+    stdin_open: true
+    tty: true
+    networks:
+      - tally-network
+    healthcheck:
+      test: ["CMD", "node", "-e", "process.exit(0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # PostgreSQL service for testing/development (optional)
+  postgres:
+    image: postgres:15-alpine
+    container_name: tally-test-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: tally_test
+      POSTGRES_USER: tally_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-tally_dev_password}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - tally-network
+    profiles:
+      - testing
+
+networks:
+  tally-network:
+    driver: bridge
+
+volumes:
+  postgres-data:

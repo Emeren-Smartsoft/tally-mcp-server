@@ -1,0 +1,70 @@
+# Tally MCP Server Configuration
+
+# Connection Settings
+connection:
+  # Primary connection method: odbc, xml_api, or file
+  method: odbc
+
+  # ODBC Configuration
+  odbc:
+    dsn: "TallyODBC"
+    connection_string: "DSN=TallyODBC;UID=;PWD=;"
+    timeout: 30
+    pool_size: 5
+
+  # XML API Configuration (fallback)
+  xml_api:
+    host: "localhost"
+    port: 9000
+    timeout: 30
+    retry_attempts: 3
+    retry_delay: 1000  # milliseconds
+
+  # File Access Configuration (last resort)
+  file:
+    data_path: "C:\\TallyPrime\\Data"
+    encoding: "utf-8"
+
+# Default Settings
+defaults:
+  company: ""  # Leave empty to use active company in Tally
+  financial_year_start: "04"  # April (04) for Indian financial year
+  date_format: "DD-MM-YYYY"
+  currency: "INR"
+  currency_symbol: "₹"
+  locale: "en-IN"
+
+# Performance Settings
+performance:
+  cache_enabled: true
+  cache_ttl: 300  # seconds (5 minutes)
+  max_records: 10000
+  batch_size: 500
+  connection_timeout: 30000  # milliseconds
+  query_timeout: 60000  # milliseconds
+
+# Report Settings
+reports:
+  date_format: "DD/MM/YYYY"
+  number_format: "en-IN"
+  decimal_places: 2
+  show_zero_balances: false
+  include_narration: true
+  max_top_entries: 10
+
+# Logging
+logging:
+  level: "info"  # debug, info, warn, error
+  file: "logs/tally-mcp-server.log"
+  console: true
+  max_file_size: "10m"
+  max_files: 5
+
+# Security
+security:
+  allowed_origins: ["localhost"]
+  max_request_size: "10mb"
+  rate_limit:
+    enabled: true
+    max_requests: 100
+    window_ms: 60000  # 1 minute
