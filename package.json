@@ -1,0 +1,41 @@
+{
+  "name": "tally-mcp-server",
+  "version": "1.0.0",
+  "description": "MCP Server for Tally accounting software integration with Copilot Studio",
+  "main": "dist/tally-mcp-server.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/tally-mcp-server.js",
+    "dev": "tsx src/tally-mcp-server.ts",
+    "lint": "eslint src/**/*.ts",
+    "lint:fix": "eslint src/**/*.ts --fix",
+    "format": "prettier --write src/**/*.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "mcp",
+    "tally",
+    "accounting",
+    "copilot-studio",
+    "financial-reporting"
+  ],
+  "author": "Emeren Smartsoft",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "odbc": "^2.4.8",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@typescript-eslint/eslint-plugin": "^7.0.0",
+    "@typescript-eslint/parser": "^7.0.0",
+    "eslint": "^8.57.0",
+    "prettier": "^3.2.5",
+    "tsx": "^4.7.1",
+    "typescript": "^5.4.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
