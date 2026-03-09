@@ -16,6 +16,22 @@ import {
   Tool,
 } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
+import { sendTallyRequest } from './tally-client.js';
+import {
+  getCompanyListRequest,
+  getSalesAccountsRequest,
+  getPurchaseAccountsRequest,
+  getReceivablesRequest,
+  getPayablesRequest,
+  getStockSummaryRequest,
+  getMonthDates,
+} from './tally-requests.js';
+import {
+  parseLedgerResponse,
+  parseCompanyListResponse,
+  parseStockItemResponse,
+  sumLedgerBalances,
+} from './xml-parser.js';
 
 // ---------------------------------------------------------------------------
 // Type Definitions
@@ -116,8 +132,8 @@ const AnalysisSchema = z.object({
 // ---------------------------------------------------------------------------
 
 const connectionState: ConnectionState = {
-  method: 'demo',
-  defaultCompany: 'Sample Company Ltd.',
+  method: 'xml_api',
+  defaultCompany: process.env.TALLY_DEFAULT_COMPANY ?? 'Sample Company Ltd.',
   connected: false,
 };
 
@@ -472,9 +488,37 @@ function generateStockData() {
 // Report Formatters
 // ---------------------------------------------------------------------------
 
-function formatMonthlySalesSummary(company: string, month: number, year: number): string {
-  const data = generateSalesData(month, year);
+async function formatMonthlySalesSummary(company: string, month: number, year: number): Promise<string> {
   const { from, to } = monthToDates(month, year);
+  const { fromDate, toDate } = getMonthDates(month, year);
+
+  try {
+    const xml = await sendTallyRequest(getSalesAccountsRequest(company, fromDate, toDate));
+    const ledgers = await parseLedgerResponse(xml);
+    if (ledgers.length > 0) {
+      const totalSales = sumLedgerBalances(ledgers);
+      const lines: string[] = [
+        `# Sales Summary - ${getMonthName(month)} ${year}`,
+        `**Company:** ${company}`,
+        `**Period:** ${formatDisplayDate(from)} to ${formatDisplayDate(to)}`,
+        '',
+        '## Key Metrics',
+        `- **Total Sales:** ${formatINR(totalSales)}`,
+        '',
+        '## Sales Accounts',
+        `| Ledger | Closing Balance |`,
+        `|--------|----------------|`,
+        ...ledgers.map((l) => `| ${l.name} | ${formatINR(Math.abs(l.closingBalance))} |`),
+        `| **Total** | **${formatINR(totalSales)}** |`,
+      ];
+      return lines.join('\n');
+    }
+  } catch {
+    // Fall through to demo data
+  }
+
+  // Demo fallback
+  const data = generateSalesData(month, year);
   const lines: string[] = [
     `# Sales Summary - ${getMonthName(month)} ${year}`,
     `**Company:** ${company}`,
@@ -493,13 +537,43 @@ function formatMonthlySalesSummary(company: string, month: number, year: number)
     '',
     '## Summary',
     `Sales for ${getMonthName(month)} ${year} ${data.growth > 0 ? 'grew' : 'declined'} by ${Math.abs(data.growth).toFixed(1)}% compared to the previous month.`,
+    '',
+    `_Note: TallyPrime not reachable — showing demo data._`,
   ];
   return lines.join('\n');
 }
 
-function formatMonthlyPurchaseSummary(company: string, month: number, year: number): string {
-  const data = generatePurchaseData(month, year);
+async function formatMonthlyPurchaseSummary(company: string, month: number, year: number): Promise<string> {
   const { from, to } = monthToDates(month, year);
+  const { fromDate, toDate } = getMonthDates(month, year);
+
+  try {
+    const xml = await sendTallyRequest(getPurchaseAccountsRequest(company, fromDate, toDate));
+    const ledgers = await parseLedgerResponse(xml);
+    if (ledgers.length > 0) {
+      const totalPurchases = sumLedgerBalances(ledgers);
+      const lines: string[] = [
+        `# Purchase Summary - ${getMonthName(month)} ${year}`,
+        `**Company:** ${company}`,
+        `**Period:** ${formatDisplayDate(from)} to ${formatDisplayDate(to)}`,
+        '',
+        '## Key Metrics',
+        `- **Total Purchases:** ${formatINR(totalPurchases)}`,
+        '',
+        '## Purchase Accounts',
+        `| Ledger | Closing Balance |`,
+        `|--------|----------------|`,
+        ...ledgers.map((l) => `| ${l.name} | ${formatINR(Math.abs(l.closingBalance))} |`),
+        `| **Total** | **${formatINR(totalPurchases)}** |`,
+      ];
+      return lines.join('\n');
+    }
+  } catch {
+    // Fall through to demo data
+  }
+
+  // Demo fallback
+  const data = generatePurchaseData(month, year);
   const lines: string[] = [
     `# Purchase Summary - ${getMonthName(month)} ${year}`,
     `**Company:** ${company}`,
@@ -515,6 +589,8 @@ function formatMonthlyPurchaseSummary(company: string, month: number, year: numb
     '',
     '## Top Vendors',
     ...data.topVendors.map((v, i) => `${i + 1}. **${v.name}:** ${formatINR(v.amount)}`),
+    '',
+    `_Note: TallyPrime not reachable — showing demo data._`,
   ];
   return lines.join('\n');
 }
@@ -910,17 +986,73 @@ function formatLedgerReport(company: string, ledgerName?: string, groupName?: st
   return lines.join('\n');
 }
 
-function formatOutstandingReport(company: string, type: 'receivable' | 'payable' | 'both'): string {
-  const data = generateOutstandingData(type);
+async function formatOutstandingReport(company: string, type: 'receivable' | 'payable' | 'both'): Promise<string> {
+  const title = `# Outstanding ${type === 'both' ? 'Receivables & Payables' : type === 'receivable' ? 'Receivables' : 'Payables'} Report`;
   const lines: string[] = [
-    `# Outstanding ${type === 'both' ? 'Receivables & Payables' : type === 'receivable' ? 'Receivables' : 'Payables'} Report`,
+    title,
+    `**Company:** ${company}`,
+    `**As on:** ${new Date().toLocaleDateString('en-IN')}`,
+    '',
+  ];
+
+  let usedRealData = false;
+
+  if (type === 'receivable' || type === 'both') {
+    try {
+      const xml = await sendTallyRequest(getReceivablesRequest(company));
+      const ledgers = await parseLedgerResponse(xml);
+      if (ledgers.length > 0) {
+        usedRealData = true;
+        const total = sumLedgerBalances(ledgers);
+        lines.push(
+          '## Outstanding Receivables (Sundry Debtors)',
+          `| Party | Balance |`,
+          `|-------|---------|`,
+          ...ledgers.map((l) => `| ${l.name} | ${formatINR(Math.abs(l.closingBalance))} |`),
+          `| **Total** | **${formatINR(total)}** |`,
+          ''
+        );
+      }
+    } catch {
+      // Fall through to demo
+    }
+  }
+
+  if (type === 'payable' || type === 'both') {
+    try {
+      const xml = await sendTallyRequest(getPayablesRequest(company));
+      const ledgers = await parseLedgerResponse(xml);
+      if (ledgers.length > 0) {
+        usedRealData = true;
+        const total = sumLedgerBalances(ledgers);
+        lines.push(
+          '## Outstanding Payables (Sundry Creditors)',
+          `| Party | Balance |`,
+          `|-------|---------|`,
+          ...ledgers.map((l) => `| ${l.name} | ${formatINR(Math.abs(l.closingBalance))} |`),
+          `| **Total** | **${formatINR(total)}** |`
+        );
+      }
+    } catch {
+      // Fall through to demo
+    }
+  }
+
+  if (usedRealData) {
+    return lines.join('\n');
+  }
+
+  // Demo fallback
+  const data = generateOutstandingData(type);
+  const demoLines: string[] = [
+    title,
     `**Company:** ${company}`,
     `**As on:** ${new Date().toLocaleDateString('en-IN')}`,
     '',
   ];
   if (type === 'receivable' || type === 'both') {
     const totalRec = data.receivables.reduce((s, r) => s + r.amount, 0);
-    lines.push(
+    demoLines.push(
       '## Outstanding Receivables',
       `| Party | Amount | Days Overdue | Ageing |`,
       `|-------|--------|--------------|--------|`,
@@ -931,7 +1063,7 @@ function formatOutstandingReport(company: string, type: 'receivable' | 'payable'
   }
   if (type === 'payable' || type === 'both') {
     const totalPay = data.payables.reduce((s, p) => s + p.amount, 0);
-    lines.push(
+    demoLines.push(
       '## Outstanding Payables',
       `| Party | Amount | Days Overdue | Ageing |`,
       `|-------|--------|--------------|--------|`,
@@ -939,10 +1071,49 @@ function formatOutstandingReport(company: string, type: 'receivable' | 'payable'
       `| **Total** | **${formatINR(totalPay)}** | | |`
     );
   }
-  return lines.join('\n');
+  demoLines.push('', `_Note: TallyPrime not reachable — showing demo data._`);
+  return demoLines.join('\n');
 }
 
-function formatStockSummary(company: string): string {
+async function formatStockSummary(company: string): Promise<string> {
+  try {
+    const xml = await sendTallyRequest(getStockSummaryRequest(company));
+    const items = await parseStockItemResponse(xml);
+    if (items.length > 0) {
+      const totalValue = items.reduce((s, i) => s + Math.abs(i.closingValue), 0);
+      // Group by parent
+      const grouped = new Map<string, typeof items>();
+      for (const item of items) {
+        const group = item.parent || 'Ungrouped';
+        if (!grouped.has(group)) grouped.set(group, []);
+        grouped.get(group)!.push(item);
+      }
+      const lines: string[] = [
+        `# Stock Summary`,
+        `**Company:** ${company}`,
+        `**As on:** ${new Date().toLocaleDateString('en-IN')}`,
+        '',
+        `## Overview`,
+        `- **Total Stock Value:** ${formatINR(totalValue)}`,
+        `- **Total Items:** ${items.length}`,
+        '',
+      ];
+      for (const [group, groupItems] of grouped) {
+        lines.push(
+          `## ${group}`,
+          `| Item | Quantity | Value |`,
+          `|------|----------|-------|`,
+          ...groupItems.map((i) => `| ${i.name} | ${i.closingBalance} | ${formatINR(Math.abs(i.closingValue))} |`),
+          ''
+        );
+      }
+      return lines.join('\n');
+    }
+  } catch {
+    // Fall through to demo data
+  }
+
+  // Demo fallback
   const data = generateStockData();
   const lines: string[] = [
     `# Stock Summary`,
@@ -971,6 +1142,7 @@ function formatStockSummary(company: string): string {
       ...data.lowStockItems.map((i) => `| ${i.name} | ${i.currentStock} | ${i.reorderLevel} |`)
     );
   }
+  lines.push('', `_Note: TallyPrime not reachable — showing demo data._`);
   return lines.join('\n');
 }
 
@@ -1234,7 +1406,31 @@ function formatCustomAnalysis(
   return lines.join('\n');
 }
 
-function formatCompanyList(): string {
+async function formatCompanyList(): Promise<string> {
+  try {
+    const xml = await sendTallyRequest(getCompanyListRequest());
+    const companies = await parseCompanyListResponse(xml);
+    if (companies.length > 0) {
+      const lines: string[] = [
+        '# Available Tally Companies',
+        '',
+        `**Current Default:** ${connectionState.defaultCompany}`,
+        '',
+        '## Companies',
+        `| # | Company Name | GUID | Books From | Last Voucher |`,
+        `|---|--------------|------|------------|--------------|`,
+        ...companies.map(
+          (c, i) =>
+            `| ${i + 1} | ${c.name} | ${c.guid || 'N/A'} | ${c.booksFrom || 'N/A'} | ${c.lastVoucherDate || 'N/A'} |`
+        ),
+      ];
+      return lines.join('\n');
+    }
+  } catch {
+    // Fall through to demo data if Tally is unavailable
+  }
+
+  // Demo fallback
   const companies: TallyCompany[] = [
     {
       name: 'Sample Company Ltd.',
@@ -1267,10 +1463,11 @@ function formatCompanyList(): string {
     `| # | Company Name | GUID | Books From | Last Voucher |`,
     `|---|--------------|------|------------|--------------|`,
     ...companies.map(
-      (c, i) => `| ${i + 1} | ${c.name} | ${c.guid} | ${formatDisplayDate(c.booksFrom)} | ${formatDisplayDate(c.lastVoucherDate)} |`
+      (c, i) =>
+        `| ${i + 1} | ${c.name} | ${c.guid} | ${formatDisplayDate(c.booksFrom)} | ${formatDisplayDate(c.lastVoucherDate)} |`
     ),
     '',
-    `_Note: Running in demo mode. Connect to TallyPrime via ODBC or XML API to see actual companies._`,
+    `_Note: TallyPrime not reachable — showing demo data. Ensure TallyPrime is running and a company is loaded._`,
   ];
   return lines.join('\n');
 }
@@ -1634,14 +1831,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'get_monthly_sales_summary': {
         const parsed = MonthYearSchema.parse(args);
         const company = resolveCompany(parsed.company);
-        const report = formatMonthlySalesSummary(company, parsed.month, parsed.year);
+        const report = await formatMonthlySalesSummary(company, parsed.month, parsed.year);
         return { content: [{ type: 'text', text: report }] };
       }
 
       case 'get_monthly_purchase_summary': {
         const parsed = MonthYearSchema.parse(args);
         const company = resolveCompany(parsed.company);
-        const report = formatMonthlyPurchaseSummary(company, parsed.month, parsed.year);
+        const report = await formatMonthlyPurchaseSummary(company, parsed.month, parsed.year);
         return { content: [{ type: 'text', text: report }] };
       }
 
@@ -1745,14 +1942,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           })
           .parse(args);
         const company = resolveCompany(parsed.company);
-        const report = formatOutstandingReport(company, parsed.type);
+        const report = await formatOutstandingReport(company, parsed.type);
         return { content: [{ type: 'text', text: report }] };
       }
 
       case 'get_stock_summary': {
         const parsed = z.object({ company: z.string().optional() }).parse(args ?? {});
         const company = resolveCompany(parsed.company);
-        const report = formatStockSummary(company);
+        const report = await formatStockSummary(company);
         return { content: [{ type: 'text', text: report }] };
       }
 
@@ -1808,7 +2005,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       // ── Utility Tools ────────────────────────────────────────────────────
       case 'get_company_list': {
-        const report = formatCompanyList();
+        const report = await formatCompanyList();
         return { content: [{ type: 'text', text: report }] };
       }
 
