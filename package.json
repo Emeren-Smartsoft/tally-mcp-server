@@ -24,11 +24,13 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
     "axios": "^1.13.6",
+    "express": "^5.2.1",
     "odbc": "^2.4.8",
     "xml2js": "^0.6.2",
     "zod": "^3.23.8"
   },
   "devDependencies": {
+    "@types/express": "^5.0.6",
     "@types/node": "^20.0.0",
     "@types/xml2js": "^0.4.14",
     "@typescript-eslint/eslint-plugin": "^7.0.0",

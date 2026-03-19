@@ -10,11 +10,14 @@
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
   Tool,
 } from '@modelcontextprotocol/sdk/types.js';
+import { randomUUID } from 'crypto';
+import express, { NextFunction, Request, Response } from 'express';
 import { z } from 'zod';
 import { sendTallyRequest } from './tally-client.js';
 import {
@@ -1801,28 +1804,33 @@ const TOOLS: Tool[] = [
 ];
 
 // ---------------------------------------------------------------------------
-// MCP Server Setup
+// MCP Server Factory
 // ---------------------------------------------------------------------------
 
-const server = new Server(
-  {
-    name: 'tally-mcp-server',
-    version: '1.0.0',
-  },
-  {
-    capabilities: {
-      tools: {},
+/**
+ * Creates and configures a new MCP Server instance with all tool handlers.
+ * Called once for stdio mode, or per-session in HTTP mode.
+ */
+function createMcpServer(): Server {
+  const srv = new Server(
+    {
+      name: 'tally-mcp-server',
+      version: '2.0.0',
     },
-  }
-);
+    {
+      capabilities: {
+        tools: {},
+      },
+    }
+  );
 
-// Handle list tools request
-server.setRequestHandler(ListToolsRequestSchema, async () => {
-  return { tools: TOOLS };
-});
+  // Handle list tools request
+  srv.setRequestHandler(ListToolsRequestSchema, async () => {
+    return { tools: TOOLS };
+  });
 
-// Handle call tool request
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  // Handle call tool request
+  srv.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
   try {
@@ -2057,16 +2065,132 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       isError: true,
     };
   }
-});
+  });
+
+  return srv;
+}
 
 // ---------------------------------------------------------------------------
 // Start Server
 // ---------------------------------------------------------------------------
 
+/** Names of all registered tools (used for the GET / info endpoint). */
+const TOOL_NAMES = TOOLS.map((t) => t.name);
+
 async function main() {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  console.error('Tally MCP Server running on stdio');
+  const transportMode = process.env.TRANSPORT ?? 'http';
+
+  if (transportMode === 'stdio') {
+    // Legacy stdio mode — keeps backward compatibility with CLI/local dev
+    const transport = new StdioServerTransport();
+    const srv = createMcpServer();
+    await srv.connect(transport);
+    console.error('Tally MCP Server running on stdio');
+    return;
+  }
+
+  // HTTP mode (default) — required for Copilot Studio / StreamableHTTP
+  const app = express();
+  app.use(express.json());
+
+  // CORS headers so Copilot Studio (browser-based) can connect
+  app.use((_req: Request, res: Response, next: NextFunction) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Mcp-Session-Id');
+    res.setHeader('Access-Control-Expose-Headers', 'Mcp-Session-Id');
+    if (_req.method === 'OPTIONS') {
+      res.sendStatus(200);
+      return;
+    }
+    next();
+  });
+
+  // Optional API-key auth for /mcp
+  const apiKey = process.env.MCP_API_KEY;
+  const mcpAuthMiddleware = (req: Request, res: Response, next: NextFunction) => {
+    if (!apiKey) {
+      // No key configured → allow unauthenticated access (for Copilot Studio)
+      return next();
+    }
+    const authHeader = req.headers['authorization'];
+    if (!authHeader || authHeader !== `Bearer ${apiKey}`) {
+      res.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+    next();
+  };
+
+  // Per-session transport store
+  const sessions = new Map<string, StreamableHTTPServerTransport>();
+
+  // POST /mcp — main MCP endpoint (Copilot Studio uses this)
+  app.post('/mcp', mcpAuthMiddleware, async (req: Request, res: Response) => {
+    const sessionId = req.headers['mcp-session-id'] as string | undefined;
+    let transport: StreamableHTTPServerTransport;
+
+    if (sessionId && sessions.has(sessionId)) {
+      transport = sessions.get(sessionId)!;
+    } else {
+      // Create a new transport + server instance for this session
+      transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => randomUUID(),
+        onsessioninitialized: (sid) => {
+          sessions.set(sid, transport);
+        },
+      });
+      transport.onclose = () => {
+        if (transport.sessionId) sessions.delete(transport.sessionId);
+      };
+      const sessionServer = createMcpServer();
+      await sessionServer.connect(transport);
+    }
+    await transport.handleRequest(req, res, req.body);
+  });
+
+  // GET /mcp — SSE stream for existing sessions
+  app.get('/mcp', mcpAuthMiddleware, async (req: Request, res: Response) => {
+    const sessionId = req.headers['mcp-session-id'] as string | undefined;
+    const transport = sessionId ? sessions.get(sessionId) : undefined;
+    if (!transport) {
+      res.status(400).json({ error: 'Invalid or missing session ID' });
+      return;
+    }
+    await transport.handleRequest(req, res);
+  });
+
+  // DELETE /mcp — close a session
+  app.delete('/mcp', mcpAuthMiddleware, async (req: Request, res: Response) => {
+    const sessionId = req.headers['mcp-session-id'] as string | undefined;
+    const transport = sessionId ? sessions.get(sessionId) : undefined;
+    if (!transport) {
+      res.status(400).json({ error: 'Invalid or missing session ID' });
+      return;
+    }
+    await transport.handleRequest(req, res);
+    sessions.delete(sessionId!);
+  });
+
+  // GET / — server info
+  app.get('/', (_req: Request, res: Response) => {
+    res.json({
+      name: 'Tally MCP Server',
+      version: '2.0.0',
+      tools: TOOL_NAMES,
+    });
+  });
+
+  // GET /health — health check
+  app.get('/health', (_req: Request, res: Response) => {
+    res.json({ status: 'ok', server: 'Tally MCP Server', version: '2.0.0' });
+  });
+
+  const port = parseInt(process.env.PORT ?? '3000', 10);
+  app.listen(port, '0.0.0.0', () => {
+    console.error(`Tally MCP Server running on http://0.0.0.0:${port}`);
+    console.error(`MCP endpoint: http://0.0.0.0:${port}/mcp`);
+    console.error(`Auth: ${apiKey ? 'API key required' : 'No auth (open)'}`);
+  });
 }
 
 main().catch((error: unknown) => {
