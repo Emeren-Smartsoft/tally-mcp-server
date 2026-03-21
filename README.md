@@ -6,17 +6,19 @@ A comprehensive **Model Context Protocol (MCP) server** for integrating **TallyP
 
 ## Features
 
-- **25+ Financial Tools** covering monthly, annual, and operational reports
+- **27+ Financial Tools** covering monthly, annual, operational, and multi-company reports
 - **Copilot Studio Ready** — designed for seamless agent integration
 - **Indian Accounting Support** — ₹ currency, GST, Indian financial year (Apr–Mar)
+- **Multi-Company Support** — query and aggregate data from up to 5 companies in a single request
 - **Multiple Connection Methods** — ODBC (primary), XML API, and file access
 - **TypeScript** with full type safety and Zod input validation
 - **Demo Mode** — works out of the box without a live Tally installation
 - **Docker Support** — production-ready containerization
+- **Request Queue & Retry** — prevents Tally from hanging under concurrent load; automatically retries on transient failures
 
 ---
 
-## Available Tools (25 total)
+## Available Tools (27 total)
 
 ### Monthly Reports (7 tools)
 | Tool | Description |
@@ -62,6 +64,14 @@ A comprehensive **Model Context Protocol (MCP) server** for integrating **TallyP
 |------|-------------|
 | `get_company_list` | List available Tally companies |
 | `set_default_company` | Set default company for operations |
+
+### Multi-Company Tools (2 tools)
+| Tool | Description |
+|------|-------------|
+| `get_multi_company_sales_summary` | Monthly sales aggregated across multiple companies |
+| `get_multi_company_report` | Generic multi-company report (sales, purchases, outstanding, stock) |
+
+> **Multi-company tools** accept a `companies` array (1–5 names) and return a company-wise breakdown plus an aggregate total. One failing company does not block others.
 
 ---
 

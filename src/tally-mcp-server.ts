@@ -19,7 +19,7 @@ import {
 import { randomUUID } from 'crypto';
 import express, { NextFunction, Request, Response } from 'express';
 import { z } from 'zod';
-import { sendTallyRequest } from './tally-client.js';
+import { sendTallyRequest, sendTallyRequestWithRetry } from './tally-client.js';
 import {
   getCompanyListRequest,
   getSalesAccountsRequest,
@@ -128,6 +128,29 @@ const AnalysisSchema = z.object({
   year: z.number().int().min(2000).max(2100).describe('Financial year'),
   month: z.number().int().min(1).max(12).optional().describe('Month (required for monthly analysis)'),
   company: z.string().optional().describe('Company name (uses default if not specified)'),
+});
+
+const MultiCompanyMonthYearSchema = z.object({
+  companies: z
+    .array(z.string().min(1))
+    .min(1)
+    .max(5)
+    .describe('List of company names to query (1-5 companies)'),
+  month: z.number().int().min(1).max(12).describe('Month number (1-12)'),
+  year: z.number().int().min(2000).max(2100).describe('Four-digit year'),
+});
+
+const MultiCompanyReportSchema = z.object({
+  companies: z
+    .array(z.string().min(1))
+    .min(1)
+    .max(5)
+    .describe('List of company names to query (1-5 companies)'),
+  report_type: z
+    .enum(['sales', 'purchases', 'outstanding_receivables', 'outstanding_payables', 'stock'])
+    .describe('Type of report to generate for each company'),
+  month: z.number().int().min(1).max(12).optional().describe('Month (required for sales/purchases)'),
+  year: z.number().int().min(2000).max(2100).optional().describe('Year (required for sales/purchases)'),
 });
 
 // ---------------------------------------------------------------------------
@@ -1476,6 +1499,210 @@ async function formatCompanyList(): Promise<string> {
 }
 
 // ---------------------------------------------------------------------------
+// Multi-Company Helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Fetch data from multiple companies in parallel, capturing per-company errors
+ * so that one failing company does not block the others.
+ */
+async function fetchFromMultipleCompanies<T>(
+  companies: string[],
+  fetchFn: (company: string) => Promise<T>
+): Promise<Array<{ company: string; data?: T; error?: string }>> {
+  const results = await Promise.allSettled(companies.map((company) => fetchFn(company)));
+  return companies.map((company, index) => {
+    const result = results[index];
+    if (!result) return { company, error: 'Internal error: missing result' };
+    if (result.status === 'fulfilled') {
+      return { company, data: result.value };
+    }
+    const errMsg = result.reason instanceof Error ? result.reason.message : String(result.reason);
+    return { company, error: errMsg };
+  });
+}
+
+/**
+ * Build a multi-company sales summary report for a given month/year.
+ */
+async function formatMultiCompanySalesSummary(
+  companies: string[],
+  month: number,
+  year: number
+): Promise<string> {
+  const { fromDate, toDate } = getMonthDates(month, year);
+  const { from, to } = monthToDates(month, year);
+
+  const results = await fetchFromMultipleCompanies(companies, async (company) => {
+    const xml = await sendTallyRequestWithRetry(
+      getSalesAccountsRequest(company, fromDate, toDate)
+    );
+    const ledgers = await parseLedgerResponse(xml);
+    const total = sumLedgerBalances(ledgers);
+    return { ledgers, total };
+  });
+
+  const lines: string[] = [
+    `# Multi-Company Sales Summary — ${getMonthName(month)} ${year}`,
+    `**Period:** ${formatDisplayDate(from)} to ${formatDisplayDate(to)}`,
+    `**Companies queried:** ${companies.length}`,
+    '',
+  ];
+
+  let grandTotal = 0;
+  let hasRealData = false;
+
+  for (const { company, data, error } of results) {
+    if (error) {
+      lines.push(`## ${company}`, `> ⚠️ Could not fetch data: ${error}`, '');
+      continue;
+    }
+    if (data && data.ledgers.length > 0) {
+      hasRealData = true;
+      grandTotal += data.total;
+      lines.push(
+        `## ${company}`,
+        `| Ledger | Closing Balance |`,
+        `|--------|----------------|`,
+        ...data.ledgers.map((l) => `| ${l.name} | ${formatINR(Math.abs(l.closingBalance))} |`),
+        `| **Total** | **${formatINR(data.total)}** |`,
+        ''
+      );
+    } else {
+      // Demo fallback for this company
+      const demo = generateSalesData(month, year);
+      grandTotal += demo.totalSales;
+      lines.push(
+        `## ${company}`,
+        `- **Total Sales:** ${formatINR(demo.totalSales)}`,
+        `- **Transactions:** ${demo.numberOfTransactions}`,
+        `_Note: Demo data — TallyPrime not reachable for this company._`,
+        ''
+      );
+    }
+  }
+
+  lines.push('---', `## Aggregate Total`, `**Combined Sales (all companies):** ${formatINR(grandTotal)}`);
+  if (!hasRealData) {
+    lines.push('', `_Note: TallyPrime not reachable — showing demo data._`);
+  }
+  return lines.join('\n');
+}
+
+/**
+ * Build a generic multi-company report for various report types.
+ */
+async function formatMultiCompanyReport(
+  companies: string[],
+  reportType: 'sales' | 'purchases' | 'outstanding_receivables' | 'outstanding_payables' | 'stock',
+  month?: number,
+  year?: number
+): Promise<string> {
+  type CompanyResult = { total: number; detail: string };
+
+  const results = await fetchFromMultipleCompanies<CompanyResult>(companies, async (company) => {
+    switch (reportType) {
+      case 'sales': {
+        if (!month || !year) throw new Error('month and year are required for sales report');
+        const { fromDate, toDate } = getMonthDates(month, year);
+        const xml = await sendTallyRequestWithRetry(
+          getSalesAccountsRequest(company, fromDate, toDate)
+        );
+        const ledgers = await parseLedgerResponse(xml);
+        const total = sumLedgerBalances(ledgers);
+        const detail = ledgers.map((l) => `  - ${l.name}: ${formatINR(Math.abs(l.closingBalance))}`).join('\n');
+        return { total, detail };
+      }
+      case 'purchases': {
+        if (!month || !year) throw new Error('month and year are required for purchases report');
+        const { fromDate, toDate } = getMonthDates(month, year);
+        const xml = await sendTallyRequestWithRetry(
+          getPurchaseAccountsRequest(company, fromDate, toDate)
+        );
+        const ledgers = await parseLedgerResponse(xml);
+        const total = sumLedgerBalances(ledgers);
+        const detail = ledgers.map((l) => `  - ${l.name}: ${formatINR(Math.abs(l.closingBalance))}`).join('\n');
+        return { total, detail };
+      }
+      case 'outstanding_receivables': {
+        const xml = await sendTallyRequestWithRetry(getReceivablesRequest(company));
+        const ledgers = await parseLedgerResponse(xml);
+        const total = sumLedgerBalances(ledgers);
+        const detail = ledgers.map((l) => `  - ${l.name}: ${formatINR(Math.abs(l.closingBalance))}`).join('\n');
+        return { total, detail };
+      }
+      case 'outstanding_payables': {
+        const xml = await sendTallyRequestWithRetry(getPayablesRequest(company));
+        const ledgers = await parseLedgerResponse(xml);
+        const total = sumLedgerBalances(ledgers);
+        const detail = ledgers.map((l) => `  - ${l.name}: ${formatINR(Math.abs(l.closingBalance))}`).join('\n');
+        return { total, detail };
+      }
+      case 'stock': {
+        const xml = await sendTallyRequestWithRetry(getStockSummaryRequest(company));
+        const items = await parseStockItemResponse(xml);
+        const total = items.reduce((s, i) => s + Math.abs(i.closingValue), 0);
+        const detail = items.map((i) => `  - ${i.name}: ${i.closingBalance} @ ${formatINR(Math.abs(i.closingValue))}`).join('\n');
+        return { total, detail };
+      }
+    }
+  });
+
+  const reportTitles: Record<typeof reportType, string> = {
+    sales: 'Sales',
+    purchases: 'Purchases',
+    outstanding_receivables: 'Outstanding Receivables',
+    outstanding_payables: 'Outstanding Payables',
+    stock: 'Stock Summary',
+  };
+  const title = reportTitles[reportType];
+  const periodLabel =
+    month && year ? ` — ${getMonthName(month)} ${year}` : ` — As on ${new Date().toLocaleDateString('en-IN')}`;
+
+  const lines: string[] = [
+    `# Multi-Company ${title} Report${periodLabel}`,
+    `**Companies queried:** ${companies.length}`,
+    '',
+    `## Company-wise Breakdown`,
+    `| Company | ${title} | Status |`,
+    `|---------|${''.padEnd(title.length + 2, '-')}|--------|`,
+  ];
+
+  let grandTotal = 0;
+  const errorCompanies: string[] = [];
+
+  for (const { company, data, error } of results) {
+    if (error) {
+      lines.push(`| ${company} | N/A | ⚠️ Error |`);
+      errorCompanies.push(company);
+    } else if (data) {
+      grandTotal += data.total;
+      lines.push(`| ${company} | ${formatINR(data.total)} | ✅ OK |`);
+    }
+  }
+
+  lines.push(`| **Total** | **${formatINR(grandTotal)}** | |`, '');
+
+  // Per-company detail
+  for (const { company, data, error } of results) {
+    if (error) {
+      lines.push(`## ${company}`, `> ⚠️ Error: ${error}`, '');
+    } else if (data && data.detail) {
+      lines.push(`## ${company}`, data.detail, '');
+    }
+  }
+
+  if (errorCompanies.length > 0) {
+    lines.push(
+      `---`,
+      `_Note: Data could not be fetched for: ${errorCompanies.join(', ')}. Ensure TallyPrime is running and those companies are loaded._`
+    );
+  }
+
+  return lines.join('\n');
+}
+
+// ---------------------------------------------------------------------------
 // Tool Definitions
 // ---------------------------------------------------------------------------
 
@@ -1801,6 +2028,62 @@ const TOOLS: Tool[] = [
       required: ['company'],
     },
   },
+  // ── Multi-Company Tools ───────────────────────────────────────────────────
+  {
+    name: 'get_multi_company_sales_summary',
+    description:
+      'Fetch monthly sales data from multiple companies and return an aggregated report with company-wise breakdown',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        companies: {
+          type: 'array',
+          items: { type: 'string' },
+          minItems: 1,
+          maxItems: 5,
+          description: 'List of company names to query (1-5 companies)',
+        },
+        month: { type: 'number', description: 'Month number (1-12)', minimum: 1, maximum: 12 },
+        year: { type: 'number', description: 'Four-digit year', minimum: 2000, maximum: 2100 },
+      },
+      required: ['companies', 'month', 'year'],
+    },
+  },
+  {
+    name: 'get_multi_company_report',
+    description:
+      'Generic multi-company report aggregator. Supports sales, purchases, outstanding receivables/payables, and stock summary across multiple companies.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        companies: {
+          type: 'array',
+          items: { type: 'string' },
+          minItems: 1,
+          maxItems: 5,
+          description: 'List of company names to query (1-5 companies)',
+        },
+        report_type: {
+          type: 'string',
+          enum: ['sales', 'purchases', 'outstanding_receivables', 'outstanding_payables', 'stock'],
+          description: 'Type of report to generate for each company',
+        },
+        month: {
+          type: 'number',
+          description: 'Month number (1-12) — required for sales and purchases',
+          minimum: 1,
+          maximum: 12,
+        },
+        year: {
+          type: 'number',
+          description: 'Four-digit year — required for sales and purchases',
+          minimum: 2000,
+          maximum: 2100,
+        },
+      },
+      required: ['companies', 'report_type'],
+    },
+  },
 ];
 
 // ---------------------------------------------------------------------------
@@ -2028,6 +2311,28 @@ function createMcpServer(): Server {
             },
           ],
         };
+      }
+
+      // ── Multi-Company Tools ──────────────────────────────────────────────
+      case 'get_multi_company_sales_summary': {
+        const parsed = MultiCompanyMonthYearSchema.parse(args);
+        const report = await formatMultiCompanySalesSummary(
+          parsed.companies,
+          parsed.month,
+          parsed.year
+        );
+        return { content: [{ type: 'text', text: report }] };
+      }
+
+      case 'get_multi_company_report': {
+        const parsed = MultiCompanyReportSchema.parse(args);
+        const report = await formatMultiCompanyReport(
+          parsed.companies,
+          parsed.report_type,
+          parsed.month,
+          parsed.year
+        );
+        return { content: [{ type: 'text', text: report }] };
       }
 
       default:
